@@ -1,0 +1,166 @@
+# -------- interactive_force_analysis.R --------
+
+# --- Load packages ---
+required <- c("plotly", "readr", "dplyr", "signal", "writexl", "pracma", "zoo")
+installed <- rownames(installed.packages())
+for (pkg in required) if (!(pkg %in% installed)) install.packages(pkg)
+lapply(required, library, character.only = TRUE)
+
+# --- Helper function, click-to-select points ---
+get_clicks <- function(DATA, n = 2, prompt = "Click points on the plot") {
+  plot(DATA$time, DATA$force, type = "l", col = "blue",
+       main = prompt, xlab = "Time (s)", ylab = "Force (N)")
+  message(prompt, " (click ", n, " points, then press [Esc] when done)")
+  pts <- locator(n)
+  return(pts$x)
+}
+
+# --- Step 1: Load file ---
+message("Select your force plate TXT file...")
+file_path <- choose.files(default = "", caption = "Choose Force Plate TXT File")
+
+if (length(file_path) == 0) stop("No file selected.")
+DATA <- read_table(file_path, skip = 19, col_names = FALSE)
+colnames(DATA) <- c("time", "Fx", "Fy", "force")
+
+# --- Step 2: Smooth signal BEFORE baseline correction ---
+fs <- 1000
+cutoff <- 20
+Wn <- cutoff / (fs / 2)
+butter_filter <- butter(2, W = Wn, type = "low")
+DATA$force <- filtfilt(butter_filter, DATA$force)
+
+# --- Step 3: Click to select baseline window ---
+clicks <- get_clicks(DATA, n = 2, prompt = "Click two points defining the baseline window")
+baseline_start <- min(clicks)
+baseline_end <- max(clicks)
+baseline_window <- DATA[DATA$time >= baseline_start & DATA$time <= baseline_end, ]
+baseline_force <- mean(baseline_window$force)
+DATA$force <- DATA$force - baseline_force
+
+# --- Step 4: Plot corrected curve for confirmation ---
+plot(DATA$time, DATA$force, type = "l", col = "blue",
+     main = "Smoothed + Baseline Corrected Force-Time Curve",
+     xlab = "Time (s)", ylab = "Force (N)")
+rect(baseline_start, min(DATA$force), baseline_end, max(DATA$force),
+     col = rgb(1, 0.6, 0, 0.2), border = NA)
+message(sprintf("✅ Baseline corrected using window %.3f–%.3f s", baseline_start, baseline_end))
+
+# --- Step 5: Click to select repetitions ---
+n_reps <- as.numeric(readline("How many reps were completed (1 to 5)? "))
+rep_times <- data.frame(Rep = 1:5, t_start = NA, t_end = NA)
+for (i in 1:n_reps) {
+  clicks <- get_clicks(DATA, n = 2, prompt = paste("Click start and end for Rep", i))
+  rep_times$t_start[i] <- min(clicks)
+  rep_times$t_end[i] <- max(clicks)
+  message(sprintf("Rep %d window: %.3f–%.3f s", i, rep_times$t_start[i], rep_times$t_end[i]))
+}
+
+# --- Step 6: Initialise storage ---
+rep_data_list <- list()
+results <- data.frame(
+  Rep = 1:5,
+  Time_Zero = NA,
+  RFD_50ms = NA, RFD_100ms = NA, RFD_200ms = NA, RFD_Peak = NA,
+  Time_to_Peak = NA, Peak_Force = NA, Peak_Time = NA, Pre_Peak_Min = NA,
+  Impulse_50ms = NA, Impulse_100ms = NA, Impulse_200ms = NA, Impulse_to_Peak = NA
+)
+
+# --- Step 7: Analyse each rep ---
+sustained_N <- 10
+min_derivative <- 50
+min_force_increase <- 20
+
+for (i in 1:n_reps) {
+  t_start <- rep_times$t_start[i]
+  t_end <- rep_times$t_end[i]
+  rep_data <- DATA[DATA$time >= t_start & DATA$time <= t_end, c("time", "force")]
+  rep_data_list[[paste0("rep_data_", i)]] <- rep_data
+  
+  if (nrow(rep_data) == 0 || all(is.na(rep_data$force))) {
+    warning(paste("⚠️ No valid data for Rep", i, "- skipping."))
+    next
+  }
+  
+  peak_index <- which.max(rep_data$force)
+  peak_force <- rep_data$force[peak_index]
+  peak_time <- rep_data$time[peak_index]
+  pre_peak_min <- min(rep_data$force[1:peak_index])
+  local_baseline <- min(rep_data$force)
+  threshold_5pc <- local_baseline + 0.05 * (peak_force - local_baseline)
+  
+  force_deriv <- diff(rep_data$force) / diff(rep_data$time)
+  force_deriv <- c(force_deriv, NA)
+  roll_deriv <- rollapply(force_deriv, width = sustained_N, FUN = mean, align = "left", fill = NA)
+  force_window_diff <- rollapply(rep_data$force, width = sustained_N,
+                                 FUN = function(x) max(x) - min(x), align = "left", fill = NA)
+  logic_vec <- rep_data$force >= threshold_5pc &
+               roll_deriv >= min_derivative &
+               force_window_diff >= min_force_increase
+  
+  sustained_indices <- which(logic_vec)
+  if (length(sustained_indices) == 0) {
+    warning(paste("⚠️ Rep", i, "has no valid sustained rise. Falling back to basic threshold."))
+    time_zero_index <- which(rep_data$force >= threshold_5pc)[1]
+  } else {
+    time_zero_index <- sustained_indices[1]
+  }
+  
+  time_zero <- rep_data$time[time_zero_index]
+  time_50ms <- time_zero + 0.05
+  time_100ms <- time_zero + 0.1
+  time_200ms <- time_zero + 0.2
+  
+  force_time_zero <- rep_data$force[time_zero_index]
+  force_50ms <- rep_data$force[which.min(abs(rep_data$time - time_50ms))]
+  force_100ms <- rep_data$force[which.min(abs(rep_data$time - time_100ms))]
+  force_200ms <- rep_data$force[which.min(abs(rep_data$time - time_200ms))]
+  
+  RFD_50ms <- (force_50ms - force_time_zero) / 0.05
+  RFD_100ms <- (force_100ms - force_time_zero) / 0.1
+  RFD_200ms <- (force_200ms - force_time_zero) / 0.2
+  time_to_peak <- rep_data$time[peak_index] - time_zero
+  RFD_peak <- (peak_force - force_time_zero) / time_to_peak
+  
+  i_50 <- which(rep_data$time >= time_zero & rep_data$time <= time_50ms)
+  i_100 <- which(rep_data$time >= time_zero & rep_data$time <= time_100ms)
+  i_200 <- which(rep_data$time >= time_zero & rep_data$time <= time_200ms)
+  i_peak <- which(rep_data$time >= time_zero & rep_data$time <= peak_time)
+  
+  Impulse_50ms <- max(0, trapz(rep_data$time[i_50], rep_data$force[i_50]))
+  Impulse_100ms <- max(0, trapz(rep_data$time[i_100], rep_data$force[i_100]))
+  Impulse_200ms <- max(0, trapz(rep_data$time[i_200], rep_data$force[i_200]))
+  Impulse_to_peak <- max(0, trapz(rep_data$time[i_peak], rep_data$force[i_peak]))
+  
+  results[i, ] <- c(i, time_zero, RFD_50ms, RFD_100ms, RFD_200ms,
+                    RFD_peak, time_to_peak, peak_force, peak_time,
+                    pre_peak_min, Impulse_50ms, Impulse_100ms,
+                    Impulse_200ms, Impulse_to_Peak = Impulse_to_peak)
+}
+
+# --- Step 8: Visualise reps (optional) ---
+for (i in 1:n_reps) {
+  rep_data <- rep_data_list[[paste0("rep_data_", i)]]
+  if (is.null(rep_data) || nrow(rep_data) == 0 || is.na(results$Time_Zero[i])) next
+  time_zero <- results$Time_Zero[i]
+  peak_time <- results$Peak_Time[i]
+  time_50ms <- time_zero + 0.05
+  time_100ms <- time_zero + 0.1
+  time_200ms <- time_zero + 0.2
+  plot(rep_data$time, rep_data$force, type = "l", col = "blue",
+       main = paste("Rep", i, "- Force-Time Curve"),
+       xlab = "Time (s)", ylab = "Force (N)")
+  abline(v = c(time_zero, time_50ms, time_100ms, time_200ms, peak_time),
+         col = c("red", "green", "orange", "purple", "black"),
+         lty = c(2, 3, 3, 3, 4))
+}
+
+# --- Step 9: Save if confirmed ---
+save_data <- tolower(readline("Save this data to Excel? (yes/no): "))
+if (save_data %in% c("yes", "y")) {
+  save_path <- file.path(getwd(), "force_output.xlsx")
+  write_xlsx(results, save_path)
+  message("✅ Results saved to: ", save_path)
+} else {
+  message("❌ Data not saved. You can rerun or adjust manually.")
+}
